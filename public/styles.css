@@ -173,6 +173,13 @@ button:hover:not(:disabled) {
   background: var(--brand-dark);
 }
 
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 3px solid #8ccf9f;
+  outline-offset: 3px;
+}
+
 button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
@@ -226,6 +233,10 @@ td {
 th {
   color: var(--muted);
   font-size: 0.86rem;
+}
+
+td .hint {
+  margin-bottom: 12px;
 }
 
 td input,
