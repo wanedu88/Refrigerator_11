@@ -130,7 +130,16 @@ function renderIngredients() {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
     cell.colSpan = 5;
-    cell.textContent = "아직 인식된 재료가 없습니다. 직접 추가할 수도 있습니다.";
+    const message = document.createElement("p");
+    message.className = "hint";
+    message.textContent =
+      '인식된 재료가 없습니다. 사진이 어둡거나 재료가 가려졌을 수 있어요. 다시 촬영하거나 "재료 추가"로 직접 입력해 주세요.';
+    const addButton = document.createElement("button");
+    addButton.type = "button";
+    addButton.className = "secondary";
+    addButton.textContent = "재료 직접 추가";
+    addButton.addEventListener("click", addIngredient);
+    cell.append(message, addButton);
     row.append(cell);
     ingredientsTable.append(row);
     return;
@@ -143,6 +152,7 @@ function renderIngredients() {
     const nameInput = document.createElement("input");
     nameInput.value = ingredient.name;
     nameInput.placeholder = "예: egg";
+    nameInput.setAttribute("aria-label", "재료명");
     nameInput.addEventListener("input", (event) => {
       updateIngredient(index, "name", event.target.value);
     });
@@ -152,6 +162,7 @@ function renderIngredients() {
     const quantityInput = document.createElement("input");
     quantityInput.value = ingredient.quantity_hint;
     quantityInput.placeholder = "예: about 6";
+    quantityInput.setAttribute("aria-label", "수량 힌트");
     quantityInput.addEventListener("input", (event) => {
       updateIngredient(index, "quantity_hint", event.target.value);
     });
@@ -159,6 +170,7 @@ function renderIngredients() {
 
     const confidenceCell = document.createElement("td");
     const confidenceSelect = document.createElement("select");
+    confidenceSelect.setAttribute("aria-label", "신뢰도");
     for (const value of ["low", "medium", "high"]) {
       const option = document.createElement("option");
       option.value = value;
@@ -175,6 +187,7 @@ function renderIngredients() {
     const notesInput = document.createElement("input");
     notesInput.value = ingredient.notes;
     notesInput.placeholder = "예: partially visible";
+    notesInput.setAttribute("aria-label", "메모");
     notesInput.addEventListener("input", (event) => {
       updateIngredient(index, "notes", event.target.value);
     });
@@ -185,6 +198,7 @@ function renderIngredients() {
     deleteButton.type = "button";
     deleteButton.className = "delete-button";
     deleteButton.textContent = "삭제";
+    deleteButton.setAttribute("aria-label", "이 재료 삭제");
     deleteButton.addEventListener("click", () => deleteIngredient(index));
     deleteCell.append(deleteButton);
 
@@ -228,7 +242,8 @@ function renderRecipeIngredients() {
     chip.type = "button";
     chip.className = "chip";
     chip.title = "이 재료를 레시피 생성에서 제외";
-    chip.textContent = `${ingredient.name} ×`;
+    chip.textContent = `${ingredient.name} 제외`;
+    chip.setAttribute("aria-label", `${ingredient.name} 재료를 레시피 생성에서 제외`);
     chip.addEventListener("click", () => {
       confirmedIngredients = confirmedIngredients.filter((_, itemIndex) => itemIndex !== index);
       renderRecipeIngredients();
@@ -385,7 +400,7 @@ async function analyzeImage() {
   }
 
   setBusy(true);
-  setStatus("OpenRouter로 이미지를 분석하고 있습니다. 무료 모델은 잠시 지연될 수 있습니다.");
+  setStatus("사진에서 재료를 찾고 있습니다. 보통 10~20초 정도 걸릴 수 있어요.");
 
   try {
     const response = await fetch("/api/recognize-ingredients", {
@@ -410,7 +425,10 @@ async function analyzeImage() {
     resultsPanel.classList.remove("is-hidden");
     setStatus(`분석 완료: ${ingredients.length}개 재료를 찾았습니다.`, "success");
   } catch (error) {
-    setStatus(error.message || "이미지 분석 중 오류가 발생했습니다.", "error");
+    setStatus(
+      error.message || "재료를 찾지 못했습니다. 사진을 다시 선택하거나 재료를 직접 추가해 주세요.",
+      "error",
+    );
   } finally {
     setBusy(false);
   }
@@ -436,13 +454,18 @@ function confirmIngredients() {
     confirmed_at: new Date().toISOString(),
   };
 
+  if (payload.ingredients.length === 0) {
+    setStatus('재료를 1개 이상 입력해 주세요. 인식 결과가 없으면 "재료 추가"로 직접 입력할 수 있습니다.', "error");
+    return;
+  }
+
   localStorage.setItem("step1.confirmedIngredients", JSON.stringify(payload));
   confirmedIngredients = payload.ingredients;
-  confirmedOutput.textContent = JSON.stringify(payload, null, 2);
+  confirmedOutput.textContent = `확정된 재료 ${payload.ingredients.length}개가 저장되었습니다.`;
   confirmedOutput.classList.remove("is-hidden");
   recipePanel.classList.remove("is-hidden");
   renderRecipeIngredients();
-  setStatus("재료 목록을 확정했고 브라우저에 저장했습니다. Step 2에서 사용할 수 있습니다.", "success");
+  setStatus("재료 목록을 확정했습니다. 아래에서 취향을 선택한 뒤 레시피를 생성하세요.", "success");
   setRecipeStatus("확정된 재료로 레시피를 생성할 수 있습니다.");
   recipePanel.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -454,7 +477,7 @@ async function generateRecipes() {
   }
 
   setRecipeBusy(true);
-  setRecipeStatus("OpenRouter로 레시피를 생성하고 있습니다. 무료 모델은 잠시 지연될 수 있습니다.");
+  setRecipeStatus("확정한 재료로 레시피를 만들고 있습니다. 잠시만 기다려 주세요.");
 
   try {
     const response = await fetch("/api/generate-recipes", {
@@ -477,7 +500,10 @@ async function generateRecipes() {
     renderRecipes();
     setRecipeStatus(`${recipes.length}개 레시피를 생성했습니다.`, "success");
   } catch (error) {
-    setRecipeStatus(error.message || "레시피 생성 중 오류가 발생했습니다.", "error");
+    setRecipeStatus(
+      error.message || "레시피를 만들지 못했습니다. 잠시 후 다시 시도하거나 조건을 줄여 보세요.",
+      "error",
+    );
   } finally {
     setRecipeBusy(false);
   }

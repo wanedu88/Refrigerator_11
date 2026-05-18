@@ -1,14 +1,18 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const publicDir = join(__dirname, "public");
+const publicDir = resolve(__dirname, "public");
 const port = Number(process.env.PORT || 3000);
 const imageModel = "google/gemma-3-27b-it:free";
 const recipeModel = "deepseek/deepseek-chat-v3.1:free";
 const maxBodyBytes = 14 * 1024 * 1024;
+const openRouterTimeoutMs = 45_000;
+const rateLimitWindowMs = 60_000;
+const rateLimitMaxRequests = 20;
+const rateLimitBuckets = new Map();
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -59,6 +63,12 @@ function sendJson(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
+function createHttpError(message, statusCode) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
 function readRequestBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -78,6 +88,140 @@ function readRequestBody(req) {
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+}
+
+function boundedString(value, maxLength = 160) {
+  return String(value || "").trim().slice(0, maxLength);
+}
+
+function clampNumber(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+
+  return Math.min(max, Math.max(min, Math.round(number)));
+}
+
+function allowedValue(value, allowed, fallback) {
+  return allowed.includes(value) ? value : fallback;
+}
+
+function isJsonRequest(req) {
+  return String(req.headers["content-type"] || "").toLowerCase().includes("application/json");
+}
+
+function isAllowedBrowserOrigin(req) {
+  const source = req.headers.origin || req.headers.referer;
+  if (!source) {
+    return true;
+  }
+
+  try {
+    const sourceUrl = new URL(source);
+    const host = String(req.headers.host || "");
+    return sourceUrl.host === host;
+  } catch {
+    return false;
+  }
+}
+
+function getClientKey(req) {
+  const forwardedFor = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwardedFor || req.socket.remoteAddress || "unknown";
+}
+
+function checkRateLimit(req) {
+  const now = Date.now();
+  const key = `${getClientKey(req)}:${req.url}`;
+  const bucket = rateLimitBuckets.get(key);
+
+  if (!bucket || now > bucket.resetAt) {
+    rateLimitBuckets.set(key, { count: 1, resetAt: now + rateLimitWindowMs });
+    return null;
+  }
+
+  bucket.count += 1;
+  if (bucket.count > rateLimitMaxRequests) {
+    return createHttpError("Too many requests. Please wait and try again.", 429);
+  }
+
+  return null;
+}
+
+function validateApiRequest(req) {
+  if (!isJsonRequest(req)) {
+    return createHttpError("Content-Type must be application/json.", 415);
+  }
+
+  if (!isAllowedBrowserOrigin(req)) {
+    return createHttpError("Request origin is not allowed.", 403);
+  }
+
+  return checkRateLimit(req);
+}
+
+function sendClientError(res, error, fallbackMessage) {
+  const statusCode = error.statusCode || 500;
+  const safeMessageByStatus = {
+    400: error.message,
+    403: error.message,
+    413: error.message,
+    415: error.message,
+    429: error.message,
+    500: fallbackMessage,
+    502: "The AI service returned an unusable response. Please try again.",
+    504: "The AI service took too long to respond. Please try again.",
+  };
+
+  console.error(error.upstreamMessage || error.message || fallbackMessage);
+  sendJson(res, statusCode, {
+    error: safeMessageByStatus[statusCode] || fallbackMessage,
+  });
+}
+
+async function fetchOpenRouterChatCompletion(apiKey, payload) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), openRouterTimeoutMs);
+
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+        "http-referer": "http://localhost",
+        "x-title": "Refrigerator Recipe Assistant",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const responseText = await response.text();
+    let responseJson;
+    try {
+      responseJson = JSON.parse(responseText);
+    } catch {
+      responseJson = null;
+    }
+
+    if (!response.ok) {
+      const error = createHttpError("AI service request failed.", response.status);
+      error.upstreamMessage =
+        responseJson?.error?.message || `OpenRouter request failed with status ${response.status}.`;
+      throw error;
+    }
+
+    return responseJson;
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw createHttpError("AI service request timed out.", 504);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function isSupportedImageDataUrl(image) {
@@ -105,22 +249,22 @@ function extractJsonObject(text) {
 
 function normalizeIngredient(raw) {
   return {
-    name: String(raw?.name || "").trim(),
-    quantity_hint: String(raw?.quantity_hint || "").trim(),
+    name: boundedString(raw?.name, 80),
+    quantity_hint: boundedString(raw?.quantity_hint, 80),
     confidence: ["low", "medium", "high"].includes(raw?.confidence)
       ? raw.confidence
       : "medium",
-    notes: String(raw?.notes || "").trim(),
+    notes: boundedString(raw?.notes, 160),
   };
 }
 
 function normalizeRecognitionPayload(payload) {
   const ingredients = Array.isArray(payload.ingredients)
-    ? payload.ingredients.map(normalizeIngredient).filter((item) => item.name)
+    ? payload.ingredients.map(normalizeIngredient).filter((item) => item.name).slice(0, 30)
     : [];
 
   const imageQualityNotes = Array.isArray(payload.image_quality_notes)
-    ? payload.image_quality_notes.map((note) => String(note).trim()).filter(Boolean)
+    ? payload.image_quality_notes.map((note) => boundedString(note, 160)).filter(Boolean).slice(0, 5)
     : [];
 
   return {
@@ -130,35 +274,44 @@ function normalizeRecognitionPayload(payload) {
   };
 }
 
-function normalizeStringArray(value) {
+function normalizeStringArray(value, maxItems = 12, maxLength = 120) {
   return Array.isArray(value)
-    ? value.map((item) => String(item).trim()).filter(Boolean)
+    ? value.map((item) => boundedString(item, maxLength)).filter(Boolean).slice(0, maxItems)
     : [];
 }
 
 function normalizeRecipe(raw) {
-  const title = String(raw?.title || "").trim();
+  const title = boundedString(raw?.title, 100);
 
   return {
     title,
-    description: String(raw?.description || "").trim(),
-    servings: Number(raw?.servings) || 1,
-    prep_minutes: Number(raw?.prep_minutes) || 0,
-    cook_minutes: Number(raw?.cook_minutes) || 0,
-    difficulty: String(raw?.difficulty || "easy").trim(),
-    ingredients_used: normalizeStringArray(raw?.ingredients_used),
-    optional_ingredients: normalizeStringArray(raw?.optional_ingredients),
-    missing_ingredients: normalizeStringArray(raw?.missing_ingredients),
-    steps: normalizeStringArray(raw?.steps),
-    fit_reason: String(raw?.fit_reason || "").trim(),
-    substitutions: normalizeStringArray(raw?.substitutions),
-    storage_notes: String(raw?.storage_notes || "").trim(),
+    description: boundedString(raw?.description, 220),
+    servings: clampNumber(raw?.servings, 1, 8, 1),
+    prep_minutes: clampNumber(raw?.prep_minutes, 0, 180, 0),
+    cook_minutes: clampNumber(raw?.cook_minutes, 0, 240, 0),
+    difficulty: allowedValue(String(raw?.difficulty || "easy").trim(), ["easy", "medium", "hard"], "easy"),
+    ingredients_used: normalizeStringArray(raw?.ingredients_used, 20, 80),
+    optional_ingredients: normalizeStringArray(raw?.optional_ingredients, 12, 80),
+    missing_ingredients: normalizeStringArray(raw?.missing_ingredients, 12, 80),
+    steps: normalizeStringArray(raw?.steps, 12, 240),
+    fit_reason: boundedString(raw?.fit_reason, 240),
+    substitutions: normalizeStringArray(raw?.substitutions, 8, 160),
+    storage_notes: boundedString(raw?.storage_notes, 220),
   };
 }
 
-function normalizeRecipePayload(payload) {
+function normalizeRecipePayload(payload, submittedIngredients = []) {
+  const submittedNames = submittedIngredients.map((item) => item.name.toLowerCase());
   const recipes = Array.isArray(payload.recipes)
-    ? payload.recipes.map(normalizeRecipe).filter((recipe) => recipe.title && recipe.steps.length)
+    ? payload.recipes
+        .map(normalizeRecipe)
+        .filter((recipe) => {
+          const usesSubmittedIngredient =
+            submittedNames.length === 0 ||
+            recipe.ingredients_used.some((name) => submittedNames.includes(name.toLowerCase()));
+          return recipe.title && recipe.steps.length && usesSubmittedIngredient;
+        })
+        .slice(0, 3)
     : [];
 
   return {
@@ -170,20 +323,10 @@ function normalizeRecipePayload(payload) {
 async function callOpenRouter(image) {
   const apiKey = await loadEnvValue("OPENROUTER_API_KEY");
   if (!apiKey) {
-    const error = new Error("OpenRouter API key is not configured.");
-    error.statusCode = 500;
-    throw error;
+    throw createHttpError("OpenRouter API key is not configured.", 500);
   }
 
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-      "http-referer": "http://localhost",
-      "x-title": "Refrigerator Recipe Assistant",
-    },
-    body: JSON.stringify({
+  const responseJson = await fetchOpenRouterChatCompletion(apiKey, {
       model: imageModel,
       temperature: 0,
       max_tokens: 800,
@@ -209,25 +352,7 @@ async function callOpenRouter(image) {
           ],
         },
       ],
-    }),
-  });
-
-  const responseText = await response.text();
-  let responseJson;
-  try {
-    responseJson = JSON.parse(responseText);
-  } catch {
-    responseJson = null;
-  }
-
-  if (!response.ok) {
-    const message =
-      responseJson?.error?.message ||
-      `OpenRouter request failed with status ${response.status}.`;
-    const error = new Error(message);
-    error.statusCode = response.status;
-    throw error;
-  }
+    });
 
   const content = responseJson?.choices?.[0]?.message?.content;
   const modelText = Array.isArray(content)
@@ -252,31 +377,31 @@ async function handleRecognizeIngredients(req, res) {
     const result = await callOpenRouter(image);
     sendJson(res, 200, result);
   } catch (error) {
-    const statusCode = error.statusCode || 500;
-    sendJson(res, statusCode, {
-      error:
-        statusCode === 401 || statusCode === 403
-          ? "OpenRouter service is not configured correctly."
-          : error.message || "Ingredient recognition failed.",
-    });
+    sendClientError(res, error, "Ingredient recognition failed.");
   }
 }
 
 function normalizeRecipeRequestIngredient(raw) {
   return {
-    name: String(raw?.name || "").trim(),
-    quantity_hint: String(raw?.quantity_hint || "").trim(),
+    name: boundedString(raw?.name, 80),
+    quantity_hint: boundedString(raw?.quantity_hint, 80),
   };
 }
 
 function normalizePreferences(raw = {}) {
   return {
-    cuisine: String(raw.cuisine || "").trim(),
-    meal_type: String(raw.meal_type || "").trim(),
-    max_cooking_minutes: Number(raw.max_cooking_minutes) || null,
-    difficulty: String(raw.difficulty || "").trim(),
-    dietary_notes: normalizeStringArray(raw.dietary_notes),
-    kitchen_tools: normalizeStringArray(raw.kitchen_tools),
+    cuisine: boundedString(raw.cuisine, 80),
+    meal_type: allowedValue(
+      String(raw.meal_type || "").trim(),
+      ["", "breakfast", "lunch", "dinner", "snack", "side dish"],
+      "",
+    ),
+    max_cooking_minutes: raw.max_cooking_minutes
+      ? clampNumber(raw.max_cooking_minutes, 5, 180, 30)
+      : null,
+    difficulty: allowedValue(String(raw.difficulty || "").trim(), ["", "easy", "medium", "hard"], ""),
+    dietary_notes: normalizeStringArray(raw.dietary_notes, 6, 80),
+    kitchen_tools: normalizeStringArray(raw.kitchen_tools, 8, 80),
     simpler: Boolean(raw.simpler),
   };
 }
@@ -284,9 +409,7 @@ function normalizePreferences(raw = {}) {
 async function requestRecipeGeneration(ingredients, preferences, strictJsonOnly = false) {
   const apiKey = await loadEnvValue("OPENROUTER_API_KEY");
   if (!apiKey) {
-    const error = new Error("OpenRouter API key is not configured.");
-    error.statusCode = 500;
-    throw error;
+    throw createHttpError("OpenRouter API key is not configured.", 500);
   }
 
   const prompt = [
@@ -304,15 +427,7 @@ async function requestRecipeGeneration(ingredients, preferences, strictJsonOnly 
     .filter(Boolean)
     .join("\n");
 
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-      "http-referer": "http://localhost",
-      "x-title": "Refrigerator Recipe Assistant",
-    },
-    body: JSON.stringify({
+  const responseJson = await fetchOpenRouterChatCompletion(apiKey, {
       model: recipeModel,
       temperature: 0.4,
       max_tokens: 1800,
@@ -326,32 +441,14 @@ async function requestRecipeGeneration(ingredients, preferences, strictJsonOnly 
           content: prompt,
         },
       ],
-    }),
-  });
-
-  const responseText = await response.text();
-  let responseJson;
-  try {
-    responseJson = JSON.parse(responseText);
-  } catch {
-    responseJson = null;
-  }
-
-  if (!response.ok) {
-    const message =
-      responseJson?.error?.message ||
-      `OpenRouter request failed with status ${response.status}.`;
-    const error = new Error(message);
-    error.statusCode = response.status;
-    throw error;
-  }
+    });
 
   const content = responseJson?.choices?.[0]?.message?.content;
   const modelText = Array.isArray(content)
     ? content.map((part) => part?.text || "").join("\n")
     : String(content || "");
 
-  return normalizeRecipePayload(extractJsonObject(modelText));
+  return normalizeRecipePayload(extractJsonObject(modelText), ingredients);
 }
 
 async function callRecipeModel(ingredients, preferences) {
@@ -370,7 +467,7 @@ async function handleGenerateRecipes(req, res) {
   try {
     const body = JSON.parse(await readRequestBody(req));
     const ingredients = Array.isArray(body.ingredients)
-      ? body.ingredients.map(normalizeRecipeRequestIngredient).filter((item) => item.name)
+      ? body.ingredients.map(normalizeRecipeRequestIngredient).filter((item) => item.name).slice(0, 30)
       : [];
 
     if (ingredients.length === 0) {
@@ -392,23 +489,29 @@ async function handleGenerateRecipes(req, res) {
 
     sendJson(res, 200, result);
   } catch (error) {
-    const statusCode = error.statusCode || 500;
-    sendJson(res, statusCode, {
-      error:
-        statusCode === 401 || statusCode === 403
-          ? "OpenRouter service is not configured correctly."
-          : error.message || "Recipe generation failed.",
-    });
+    sendClientError(res, error, "Recipe generation failed.");
   }
 }
 
 async function serveStatic(req, res) {
-  const url = new URL(req.url, "http://localhost");
-  const requestedPath = url.pathname === "/" ? "/index.html" : url.pathname;
-  const safePath = normalize(decodeURIComponent(requestedPath)).replace(/^(\.\.[/\\])+/, "");
-  const filePath = join(publicDir, safePath);
+  let requestedPath;
+  try {
+    const url = new URL(req.url, "http://localhost");
+    requestedPath = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
+  } catch {
+    res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Bad request");
+    return;
+  }
 
-  if (!filePath.startsWith(publicDir)) {
+  const filePath = resolve(publicDir, `.${requestedPath}`);
+  const relativePath = relative(publicDir, filePath);
+
+  if (
+    relativePath === ".." ||
+    relativePath.startsWith(`..${sep}`) ||
+    isAbsolute(relativePath)
+  ) {
     res.writeHead(403);
     res.end("Forbidden");
     return;
@@ -435,11 +538,23 @@ const server = createServer((req, res) => {
   }
 
   if (req.method === "POST" && req.url === "/api/recognize-ingredients") {
+    const validationError = validateApiRequest(req);
+    if (validationError) {
+      sendClientError(res, validationError, "Invalid API request.");
+      return;
+    }
+
     handleRecognizeIngredients(req, res);
     return;
   }
 
   if (req.method === "POST" && req.url === "/api/generate-recipes") {
+    const validationError = validateApiRequest(req);
+    if (validationError) {
+      sendClientError(res, validationError, "Invalid API request.");
+      return;
+    }
+
     handleGenerateRecipes(req, res);
     return;
   }
